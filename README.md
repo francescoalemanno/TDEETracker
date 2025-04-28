@@ -33,7 +33,7 @@ This tool allows you to **track your true Total Daily Energy Expenditure (TDEE)*
 
    Example using `g++`:
    ```bash
-   g++ -O2 -std=c++17 tdee_kalman_tracker.cpp -o tdee_tracker
+   g++ -O2 -std=c++17 main.cpp -o tdee_tracker
    ```
 
 3. **Run it on your data.**
