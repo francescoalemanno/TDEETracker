@@ -13,7 +13,6 @@
 
 #include "CLI11.hpp"
 #include "Eigen/Dense"
-constexpr double EPS = 1e-6;
 
 struct LogEntry {
     std::chrono::system_clock::time_point date;
@@ -30,18 +29,14 @@ struct Estimate {
 };
 
 struct Params {
-    double calPerFatKg;
-    double rsdObsWeight;
-    double rsdWeight;
-    double rsdTDEE;
-    bool smoothTracking;
+    double calPerFatKg = 7700.0;
+    double rsdObsWeight = 0.008;
+    double rsdObsCal = 0.1;
+    double rsdWeight = 0.0001;
+    double rsdTDEE = 0.01;
+    double initialTDEE = -1;
+    bool smoothTracking = false;
 };
-
-double prettify(double x) { return std::round(x * 100000.0) / 100000.0; }
-
-double min(double a, double b) { return std::min(a, b); }
-double max(double a, double b) { return std::max(a, b); }
-double clamp(double x, double a, double b) { return min(max(x, a), b); }
 
 std::tm parseDate(const std::string &dateStr) {
     std::tm tm = {};
@@ -113,8 +108,12 @@ std::vector<Estimate> kalman(const std::vector<LogEntry> &E, const Params &P) {
     RowVector2d H(1.0, 0.0);
 
     Vector2d X(E[0].weight, E[0].cals);
+    if (P.initialTDEE>0 && (!std::isnan(P.initialTDEE))) {
+        X[1] = P.initialTDEE;
+    }
     Matrix2d V;
-    V << pow(0.007 * X[0], 2), 0, 0, pow(0.1 * X[1], 2);
+    V << pow(P.rsdObsWeight * X[0], 2)+pow(P.rsdWeight * X[0], 2),      0, 
+         0,               pow(P.rsdTDEE * X[1], 2)+pow(P.rsdObsCal * X[1], 2);
 
     struct State {
         Vector2d X;
@@ -125,12 +124,17 @@ std::vector<Estimate> kalman(const std::vector<LogEntry> &E, const Params &P) {
     std::vector<State> pred = filt, smooth = filt;
 
     for (size_t i = 1; i < E.size(); ++i) {
+        double dt = E[i].time - E[i - 1].time;
+        double avgCals = (E[i - 1].cals + E[i].cals) / 2.0;
+
+        const double Q00 = pow(P.rsdWeight * std::max(E[i].weight, 30.0), 2)  // Weight process noise
+                           + pow(dt/P.calPerFatKg*avgCals*P.rsdObsCal,2);     // Calories control noise
+        const double Q11 = pow(P.rsdTDEE * std::max(E[i].cals, 1200.0), 2);
         Matrix2d Q;
-        Q << pow(P.rsdWeight * max(E[i].weight, 30.0), 2), 0, 0,
-            pow(P.rsdTDEE * max(E[i].cals, 1200.0), 2);
+        Q << Q00, 0, 0,  Q11;
+
         Matrix<double, 1, 1> R(pow(P.rsdObsWeight * E[i].weight, 2));
 
-        double dt = E[i].time - E[i - 1].time;
 
         Matrix2d F;
         F << 1.0, -dt / P.calPerFatKg, 0.0, 1.0;
@@ -138,7 +142,6 @@ std::vector<Estimate> kalman(const std::vector<LogEntry> &E, const Params &P) {
         Matrix2d Vpred = F * V * F.transpose() + Q;
         auto S = H * Vpred * H.transpose() + R;
         auto K = Vpred * H.transpose() * S.inverse();
-        double avgCals = (E[i - 1].cals + E[i].cals) / 2.0;
         Vector2d u(dt * avgCals / P.calPerFatKg, 0.0);
         Vector2d Xpred = F * X + u;
 
@@ -181,10 +184,11 @@ void printAdvice(double goal, double currWeight, double currTDEE,
                  double calPerFatKg) {
     if (std::isnan(goal)) return;
 
-    double deltaMax = min(currTDEE * maxTDEEDeltaPct,
+    double deltaMax = std::min(currTDEE * maxTDEEDeltaPct,
                           currWeight * maxDailyChangePct * calPerFatKg);
+
     double delta =
-        clamp((goal - currWeight) * calPerFatKg, -deltaMax, deltaMax);
+        std::clamp((goal - currWeight) * calPerFatKg, -deltaMax, deltaMax);
     double suggested = currTDEE + delta;
 
     std::cout << "\nGoal: " << std::fixed << std::setprecision(1) << goal
@@ -225,17 +229,16 @@ Params calibrateParameters(std::vector<LogEntry> &entries, const Params &P) {
 int main(int argc, char **argv) {
     CLI::App app{"TDEE Kalman Tracker"};
     Params params;
-    params.calPerFatKg = 7700.0;
-    params.rsdObsWeight = 0.008;
-    params.rsdWeight = 0.0001;
-    params.rsdTDEE = 0.01;
+
     double maxDailyChangePct = 0.02 / 31.0;
     double maxTDEEDeltaPct = 0.25;
-    params.smoothTracking = false;
     bool calibrate = false;
     std::string filename;
 
     app.add_option("file", filename, "Data file to read (optional)");
+    app.add_option("-E,--initialTDEE", params.initialTDEE,
+                 "Initial value for estimated TDEE, by default it is set equal to the first day calories.")
+        ->capture_default_str();
     app.add_flag("-S,--smooth", params.smoothTracking,
                  "Apply Rauch-Tung-Striebel smoothing")
         ->capture_default_str();
@@ -245,6 +248,9 @@ int main(int argc, char **argv) {
         ->capture_default_str();
     app.add_option("--mw,--rsdObsWeight", params.rsdObsWeight,
                    "Relative measurement noise for Weight (advanced)")
+        ->capture_default_str();
+    app.add_option("--mc,--rsdObsCal", params.rsdObsCal,
+                   "Relative measurement noise for Calories (advanced)")
         ->capture_default_str();
     app.add_option("--pw,--rsdWeight", params.rsdWeight,
                    "Relative process noise for Weight (advanced)")
@@ -283,7 +289,7 @@ int main(int argc, char **argv) {
     auto estimates = kalman(entries, params);
 
     for (size_t i = 0; i < entries.size(); ++i) {
-        size_t days = min(i, size_t(7));
+        size_t days = std::min(i, size_t(7));
         double dt = (entries[i].time - entries[i - days].time);
         double scale = 7.0 / dt;
         double diff =

@@ -66,10 +66,12 @@ You can fine-tune the model using several advanced flags:
 
 | Option                         | Description |
 | :----------------------------- | :---------- |
+| `-E, --initialTDEE`             | Set initial value for estimated TDEE (default to first day calories). |
 | `-S, --smooth`                  | Apply Rauch-Tung-Striebel smoothing (better estimates by incorporating future data). |
 | `-C, --calibrate`               | Recalibrate observation noise from your dataset automatically. |
 | `-K, --calPerFatKg`             | Set calories per kg of fat mass (default 7700 kcal/kg). |
 | `--mw, --rsdObsWeight`          | Measurement noise level for weight (default 0.008, i.e., ~0.8% error). |
+| `--mc, --rsdObsCal`             | Measurement noise level for calories (default 0.1, i.e., ~10% error). |
 | `--pw, --rsdWeight`             | Process noise for weight drift (default 0.0001). |
 | `--pe, --rsdTDEE`               | Process noise for TDEE drift (default 0.01). |
 | `--maxDailyChangePct`           | Maximum safe daily weight change (% of weight per day, default: 0.02/31). |
