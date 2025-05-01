@@ -102,7 +102,7 @@ std::vector<LogEntry> parseLog(std::istream &input, double &goalWeight) {
 
 std::vector<Estimate> kalman(const std::vector<LogEntry> &E, const Params &P) {
     using namespace Eigen;
-    if (E.size() < 3) throw std::runtime_error("Need at least 3 entries");
+    if (E.size() == 0) throw std::runtime_error("Need at least 1 entry");
 
     Matrix2d I = Matrix2d::Identity();
     RowVector2d H(1.0, 0.0);
@@ -125,15 +125,15 @@ std::vector<Estimate> kalman(const std::vector<LogEntry> &E, const Params &P) {
 
     for (size_t i = 1; i < E.size(); ++i) {
         double dt = E[i].time - E[i - 1].time;
-        double avgCals = (E[i - 1].cals + E[i].cals) / 2.0;
-
-        const double Q00 = pow(P.rsdWeight * std::max(E[i].weight, 30.0), 2)  // Weight process noise
+        double avgCals = (E[i - 1].cals);
+        double avgW = ( E[i].weight) ;
+        const double Q00 = pow(P.rsdWeight * std::max(avgW, 30.0), 2)  // Weight process noise
                            + pow(dt/P.calPerFatKg*avgCals*P.rsdObsCal,2);     // Calories control noise
-        const double Q11 = pow(P.rsdTDEE * std::max(E[i].cals, 1200.0), 2);
+        const double Q11 = pow(P.rsdTDEE * std::max(avgCals, 1200.0), 2);
         Matrix2d Q;
         Q << Q00, 0, 0,  Q11;
 
-        Matrix<double, 1, 1> R(pow(P.rsdObsWeight * E[i].weight, 2));
+        Matrix<double, 1, 1> R(pow(P.rsdObsWeight * avgW, 2));
 
 
         Matrix2d F;
@@ -145,7 +145,7 @@ std::vector<Estimate> kalman(const std::vector<LogEntry> &E, const Params &P) {
         Vector2d u(dt * avgCals / P.calPerFatKg, 0.0);
         Vector2d Xpred = F * X + u;
 
-        Vector<double, 1> z(E[i].weight);
+        Vector<double, 1> z(avgW);
         Vector<double, 1> delta = z - H * Xpred;
 
         V = (I - K * H) * Vpred;
@@ -167,8 +167,7 @@ std::vector<Estimate> kalman(const std::vector<LogEntry> &E, const Params &P) {
             Matrix2d G = filt[i].V * F.transpose() * pred[i + 1].V.inverse();
 
             smooth[i].X += G * (smooth[i + 1].X - pred[i + 1].X);
-            smooth[i].V +=
-                G * (smooth[i + 1].V - pred[i + 1].V) * G.transpose();
+            smooth[i].V += G * (smooth[i + 1].V - pred[i + 1].V) * G.transpose();
         }
     }
 
@@ -179,6 +178,56 @@ std::vector<Estimate> kalman(const std::vector<LogEntry> &E, const Params &P) {
     return final;
 }
 
+std::vector<Estimate> pf_m(const std::vector<LogEntry>& E, const Params &P) {
+    if (E.size() == 0) throw std::runtime_error("Need at least 1 entry");
+    double mk = E.front().cals;
+    if (P.initialTDEE>0 && (!std::isnan(P.initialTDEE))) {
+        mk = P.initialTDEE;
+    }
+    double wk = E.front().weight;
+    const double k = P.calPerFatKg;
+    double vm = std::pow(mk * P.rsdTDEE, 2)+std::pow(mk * P.rsdObsCal, 2);
+    double vw = std::pow(wk * P.rsdObsWeight, 2)+std::pow(wk * P.rsdWeight, 2);
+
+    std::vector<Estimate> result = {Estimate{ 
+        .weight = wk,
+        .tdee = mk, 
+        .sdw = std::sqrt(vw),
+        .sdtdee = std::sqrt(vm),
+    }};
+
+    for (std::size_t i = 1; i < E.size(); ++i) {
+        double dt = E[i].time - E[i - 1].time;
+        double c = E[i - 1].cals;
+        double wo = E[i].weight;
+        double vwo = std::pow(wo * P.rsdObsWeight, 2) + std::pow(c * dt/k * P.rsdObsCal, 2);
+
+        double Gm = std::pow(dt, 2) * vm;
+        double Gw = std::pow(k, 2) * vw;
+        double Gwo = std::pow(k, 2) * vwo;
+        double S = Gm + Gw + Gwo;
+
+        double mp = (mk * (Gw + Gwo) + Gm * (c + k / dt * (wk - wo))) / S;
+        double wp = (wo * (Gm + Gw) + Gwo * (wk + dt / k * (c - mk))) / S;
+        double vwp = (Gm + Gw) / S * vwo;
+        double vmp = (Gwo + Gw) / S * vm;
+
+        mk = mp;
+        wk = wp;
+        vm = vmp + std::pow(c * P.rsdTDEE, 2);
+        vw = vwp + std::pow(wo * P.rsdWeight, 2);
+        
+        result.push_back(Estimate{ 
+            .weight = wk,
+            .tdee = mk, 
+            .sdw = std::sqrt(vw),
+            .sdtdee = std::sqrt(vm),
+        });
+    }
+
+    return result;
+}
+
 void printAdvice(double goal, double currWeight, double currTDEE,
                  double maxTDEEDeltaPct, double maxDailyChangePct,
                  double calPerFatKg) {
@@ -186,10 +235,11 @@ void printAdvice(double goal, double currWeight, double currTDEE,
 
     double deltaMax = std::min(currTDEE * maxTDEEDeltaPct,
                           currWeight * maxDailyChangePct * calPerFatKg);
-
-    double delta =
-        std::clamp((goal - currWeight) * calPerFatKg, -deltaMax, deltaMax);
-    double suggested = currTDEE + delta;
+    double deltaW = (goal - currWeight);
+    const double damp_max = 0.015*std::abs(currWeight);
+    double damping = std::min(std::abs(deltaW),damp_max)/damp_max;
+    double delta = std::clamp(deltaW * calPerFatKg, -deltaMax, deltaMax);
+    double suggested = currTDEE + delta*damping;
 
     std::cout << "\nGoal: " << std::fixed << std::setprecision(1) << goal
               << " kg | Current: " << currWeight << " kg\n"
@@ -197,6 +247,7 @@ void printAdvice(double goal, double currWeight, double currTDEE,
               << "Weekly change: " << std::fixed << std::setprecision(2)
               << (suggested - currTDEE) / calPerFatKg * 7 << " kg/week\n";
 }
+
 
 // Calibration routine
 Params calibrateParameters(std::vector<LogEntry> &entries, const Params &P) {
@@ -233,6 +284,7 @@ int main(int argc, char **argv) {
     double maxDailyChangePct = 0.02 / 31.0;
     double maxTDEEDeltaPct = 0.25;
     bool calibrate = false;
+    bool simple_particle_filter = false;
     std::string filename;
 
     app.add_option("file", filename, "Data file to read (optional)");
@@ -240,7 +292,7 @@ int main(int argc, char **argv) {
                  "Initial value for estimated TDEE, by default it is set equal to the first day calories.")
         ->capture_default_str();
     app.add_flag("-S,--smooth", params.smoothTracking,
-                 "Apply Rauch-Tung-Striebel smoothing")
+                 "Apply Rauch-Tung-Striebel smoothing (only with Kalman filter)")
         ->capture_default_str();
     app.add_option("-K,--calPerFatKg", params.calPerFatKg)
         ->capture_default_str();
@@ -264,6 +316,9 @@ int main(int argc, char **argv) {
     app.add_option("--maxTDEEDeltaPct", maxTDEEDeltaPct,
                    "maximum daily recommended relative calories change goal.")
         ->capture_default_str();
+    app.add_flag("--pf", simple_particle_filter,
+            "Use simple particle filter instead of Kalman filter.")
+        ->capture_default_str();
     CLI11_PARSE(app, argc, argv);
 
     std::istream *input;
@@ -285,8 +340,12 @@ int main(int argc, char **argv) {
     if (calibrate) {
         params = calibrateParameters(entries, params);
     }
-
-    auto estimates = kalman(entries, params);
+    std::vector<Estimate> estimates;
+    if (simple_particle_filter) {
+        estimates = pf_m(entries, params);
+    } else {
+        estimates = kalman(entries, params);
+    }
 
     for (size_t i = 0; i < entries.size(); ++i) {
         size_t days = std::min(i, size_t(7));
