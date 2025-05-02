@@ -35,6 +35,7 @@ struct Params {
     double rsdWeight = 0.0001;
     double rsdTDEE = 0.01;
     double initialTDEE = -1;
+    double pf_variance_inflation = 1.0/12.0;
     bool smoothTracking = false;
 };
 
@@ -185,7 +186,9 @@ std::vector<Estimate> pf_m(const std::vector<LogEntry>& E, const Params &P) {
         mk = P.initialTDEE;
     }
     double wk = E.front().weight;
-    const double k = P.calPerFatKg;
+    const double kfat = P.calPerFatKg;
+    const double kfat2 = kfat*kfat;
+
     double vm = std::pow(mk * P.rsdTDEE, 2)+std::pow(mk * P.rsdObsCal, 2);
     double vw = std::pow(wk * P.rsdObsWeight, 2)+std::pow(wk * P.rsdWeight, 2);
 
@@ -197,25 +200,29 @@ std::vector<Estimate> pf_m(const std::vector<LogEntry>& E, const Params &P) {
     }};
 
     for (std::size_t i = 1; i < E.size(); ++i) {
-        double dt = E[i].time - E[i - 1].time;
-        double c = E[i - 1].cals;
-        double wo = E[i].weight;
-        double vwo = std::pow(wo * P.rsdObsWeight, 2) + std::pow(c * dt/k * P.rsdObsCal, 2);
+        const double dt = E[i].time - E[i - 1].time;
+        const double dt2 = dt*dt;
+        const double c = E[i - 1].cals;
+        const double wo = E[i].weight;
+        const double vwo = std::pow(wo * P.rsdObsWeight, 2);
 
-        double Gm = std::pow(dt, 2) * vm;
-        double Gw = std::pow(k, 2) * vw;
-        double Gwo = std::pow(k, 2) * vwo;
-        double S = Gm + Gw + Gwo;
+        vm += std::pow(c * P.rsdTDEE, 2);
+        vw += std::pow(wo * P.rsdWeight, 2) + std::pow(c * dt/kfat * P.rsdObsCal, 2);
 
-        double mp = (mk * (Gw + Gwo) + Gm * (c + k / dt * (wk - wo))) / S;
-        double wp = (wo * (Gm + Gw) + Gwo * (wk + dt / k * (c - mk))) / S;
-        double vwp = (Gm + Gw) / S * vwo;
-        double vmp = (Gwo + Gw) / S * vm;
+        double mp,wp,vmp,vwp,Vresw = 0.0;
+        for (size_t iters=0; iters<25; iters++) {
+            const double denom = dt2*vm + kfat2*(Vresw + vw + vwo);
+            mp = (kfat2*mk*(Vresw + vw + vwo) + dt*vm*(c*dt + kfat*(wk - wo)))/denom;
+            wp = (kfat*(Vresw + vwo)*(c*dt - dt*mk + kfat*wk) + (dt2*vm + kfat2*vw)*wo)/denom;
+            vmp = (kfat2*vm*(Vresw + vw + vwo))/denom;
+            vwp = ((dt2*vm + kfat2*vw)*(Vresw + vwo))/denom;
+            Vresw = std::pow(wo-wp,2)*P.pf_variance_inflation;
+        }
 
         mk = mp;
         wk = wp;
-        vm = vmp + std::pow(c * P.rsdTDEE, 2);
-        vw = vwp + std::pow(wo * P.rsdWeight, 2);
+        vm = vmp;
+        vw = vwp;
         
         result.push_back(Estimate{ 
             .weight = wk,
@@ -260,15 +267,10 @@ Params calibrateParameters(std::vector<LogEntry> &entries, const Params &P) {
     double wrd = 0.0;
     double n = 0.0;
     for (int i = 1; i < entries.size() - 1; i++) {
-        double rd1 = (entries[i - 1].weight - entries[i].weight) /
-                     (entries[i - 1].time - entries[i].time);
-        double rd2 = (entries[i + 1].weight - entries[i].weight) /
-                     (entries[i + 1].time - entries[i].time);
-        double rdd = (rd1 - rd2) / (entries[i - 1].time - entries[i + 1].time) *
-                     std::sqrt(2.0 / 3.0);
-        double avd = (entries[i].weight + entries[i - 1].weight +
-                      entries[i + 1].weight) /
-                     3.0;
+        double rd1 = (entries[i - 1].weight - entries[i].weight);
+        double rd2 = (entries[i + 1].weight - entries[i].weight);
+        double rdd = (rd1 - rd2) / std::sqrt(6.0);
+        double avd = (entries[i].weight + entries[i - 1].weight + entries[i + 1].weight) / 3.0;
         double ratio = rdd / avd;
         wrd += ratio * ratio;
         n += 1.0;
@@ -317,7 +319,10 @@ int main(int argc, char **argv) {
                    "maximum daily recommended relative calories change goal.")
         ->capture_default_str();
     app.add_flag("--pf", simple_particle_filter,
-            "Use simple particle filter instead of Kalman filter.")
+            "Use simple particle filter (PF) instead of Kalman filter.")
+        ->capture_default_str();
+    app.add_option("--pf-vi", params.pf_variance_inflation,
+            "Variance inflation factor, increase for handling observed weight fluctuations more robustly (works only for PF).")
         ->capture_default_str();
     CLI11_PARSE(app, argc, argv);
 
